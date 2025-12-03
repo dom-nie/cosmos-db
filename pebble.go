@@ -133,7 +133,9 @@ func NewPebbleDB(name string, dir string, opts Options) (DB, error) {
 		cacheSize = pebbleCacheMax
 	}
 	cache := pebble.NewCache(int64(cacheSize))
-	defer cache.Unref()
+	// Note: Do NOT call cache.Unref() here. The cache must remain alive
+	// for the lifetime of the database. It will be cleaned up when the
+	// database is closed.
 
 	// Use all CPUs for compaction (dedicated machine assumption)
 	compactionWorkers := sysRes.NumCPU
@@ -156,8 +158,9 @@ func NewPebbleDB(name string, dir string, opts Options) (DB, error) {
 		L0StopWritesThreshold:       pebbleL0StopWritesThreshold,
 		LBaseMaxBytes:               pebbleLBaseMaxBytes,
 
-		// Use latest format for best performance
-		FormatMajorVersion: pebble.FormatNewest,
+		// Note: FormatMajorVersion is not set to allow PebbleDB to auto-detect
+		// the format from existing databases. This ensures compatibility with
+		// snapshots created on different versions.
 
 		// Configure 7-level LSM tree
 		Levels: make([]pebble.LevelOptions, pebbleLevelCount),
