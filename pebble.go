@@ -6,7 +6,57 @@ import (
 	"path/filepath"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/bloom"
 	"github.com/spf13/cast"
+)
+
+const (
+	// PebbleDB tuning constants optimized for Cosmos SDK workloads
+	// on dedicated machines.
+
+	// pebbleMemTableSize is the size of each memtable (64 MB).
+	// Matches sei-db configuration for Cosmos SDK workloads.
+	pebbleMemTableSize = 64 << 20
+
+	// pebbleMemTableStopWritesThreshold stops writes when this many memtables
+	// are queued for flush. With 64 MB memtables, this means up to 256 MB.
+	pebbleMemTableStopWritesThreshold = 4
+
+	// pebbleL0CompactionThreshold triggers compaction when L0 has this many files.
+	// Lower than default (4) for more aggressive compaction.
+	pebbleL0CompactionThreshold = 2
+
+	// pebbleL0StopWritesThreshold stops writes when L0 reaches this file count.
+	// Provides headroom during write bursts without excessive read amplification.
+	pebbleL0StopWritesThreshold = 500
+
+	// pebbleLBaseMaxBytes is the maximum size of the base level (64 MB).
+	pebbleLBaseMaxBytes = 64 << 20
+
+	// pebbleBlockSize is the size of data blocks in sstables (32 KB).
+	// Optimized for Cosmos SDK's mix of point lookups and range scans.
+	pebbleBlockSize = 32 << 10
+
+	// pebbleIndexBlockSize is the size of index blocks (256 KB).
+	pebbleIndexBlockSize = 256 << 10
+
+	// pebbleBloomFilterBits is bits per key for bloom filters.
+	// 10 bits provides ~1% false positive rate.
+	pebbleBloomFilterBits = 10
+
+	// pebbleLevelCount is the number of LSM tree levels.
+	pebbleLevelCount = 7
+
+	// pebbleHotLevels defines how many levels use fast compression (Snappy).
+	// Levels 0-2 are hot (Snappy), levels 3-6 are cold (Zstd).
+	pebbleHotLevels = 3
+
+	// pebbleCacheFallback is the fallback cache size when RAM detection fails (4 GB).
+	pebbleCacheFallback = 4 << 30
+
+	// pebbleCacheMax is the maximum cache size to prevent excessive GC pauses.
+	// 16 GB provides good performance while keeping GC pauses under 400ms.
+	pebbleCacheMax = 16 << 30
 )
 
 // ForceSync
@@ -71,16 +121,91 @@ type PebbleDB struct {
 var _ DB = (*PebbleDB)(nil)
 
 func NewPebbleDB(name string, dir string, opts Options) (DB, error) {
-	do := &pebble.Options{
-		Logger:                   &fatalLogger{},          // pebble info logs are messing up the logs (not a cosmossdk.io/log logger)
-		MaxConcurrentCompactions: func() int { return 3 }, // default 1
+	// Detect system resources for auto-tuning
+	sysRes := GetSystemResources()
+
+	// Calculate cache size: 1/3 of RAM, capped at 16 GB to limit GC pauses
+	cacheSize := sysRes.TotalRAM / 3
+	if cacheSize == 0 {
+		cacheSize = pebbleCacheFallback
+	}
+	if cacheSize > pebbleCacheMax {
+		cacheSize = pebbleCacheMax
+	}
+	cache := pebble.NewCache(int64(cacheSize))
+	defer cache.Unref()
+
+	// Use all CPUs for compaction (dedicated machine assumption)
+	compactionWorkers := sysRes.NumCPU
+	if compactionWorkers <= 0 {
+		compactionWorkers = 4
 	}
 
+	do := &pebble.Options{
+		// Suppress noisy pebble info logs
+		Logger: &fatalLogger{},
+
+		// Auto-tuned based on system resources
+		Cache:                    cache,
+		MaxConcurrentCompactions: func() int { return compactionWorkers },
+
+		// Fixed optimizations for Cosmos SDK workloads
+		MemTableSize:                pebbleMemTableSize,
+		MemTableStopWritesThreshold: pebbleMemTableStopWritesThreshold,
+		L0CompactionThreshold:       pebbleL0CompactionThreshold,
+		L0StopWritesThreshold:       pebbleL0StopWritesThreshold,
+		LBaseMaxBytes:               pebbleLBaseMaxBytes,
+
+		// Use latest format for best performance
+		FormatMajorVersion: pebble.FormatNewest,
+
+		// Configure 7-level LSM tree
+		Levels: make([]pebble.LevelOptions, pebbleLevelCount),
+	}
+
+	// Configure per-level options
+	for i := 0; i < len(do.Levels); i++ {
+		l := &do.Levels[i]
+
+		// Block configuration optimized for Cosmos SDK
+		l.BlockSize = pebbleBlockSize
+		l.IndexBlockSize = pebbleIndexBlockSize
+
+		// Tiered compression:
+		// - L0-L2 (hot): Snappy for faster compression/decompression
+		// - L3-L6 (cold): Zstd for better compression ratio
+		if i < pebbleHotLevels {
+			l.Compression = pebble.SnappyCompression
+		} else {
+			l.Compression = pebble.ZstdCompression
+		}
+
+		// Bloom filter on all levels except bottommost (level 6)
+		// Bottommost level doesn't benefit as much from bloom filters
+		if i < pebbleLevelCount-1 {
+			l.FilterPolicy = bloom.FilterPolicy(pebbleBloomFilterBits)
+			l.FilterType = pebble.TableFilter
+		}
+
+		// Target file size doubles per level
+		if i == 0 {
+			l.TargetFileSize = 2 << 20 // 2 MB for L0
+		} else {
+			l.TargetFileSize = do.Levels[i-1].TargetFileSize * 2
+		}
+
+		l.EnsureDefaults()
+	}
+
+	// Set flush split bytes to match L0 target file size
+	do.FlushSplitBytes = do.Levels[0].TargetFileSize
+
+	// Apply defaults for any unset options
 	do.EnsureDefaults()
 
+	// Override from user-provided options
 	if opts != nil {
-		files := cast.ToInt(opts.Get("maxopenfiles"))
-		if files > 0 {
+		if files := cast.ToInt(opts.Get("maxopenfiles")); files > 0 {
 			do.MaxOpenFiles = files
 		}
 	}
@@ -90,9 +215,19 @@ func NewPebbleDB(name string, dir string, opts Options) (DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &PebbleDB{
-		db: p,
-	}, err
+
+	return &PebbleDB{db: p}, nil
+}
+
+// NewPebbleDBWithOpts creates a PebbleDB with full control over pebble.Options.
+// Use this when you need custom configuration beyond what NewPebbleDB provides.
+func NewPebbleDBWithOpts(name string, dir string, o *pebble.Options) (*PebbleDB, error) {
+	dbPath := filepath.Join(dir, name+DBFileSuffix)
+	p, err := pebble.Open(dbPath, o)
+	if err != nil {
+		return nil, err
+	}
+	return &PebbleDB{db: p}, nil
 }
 
 // Get implements DB.

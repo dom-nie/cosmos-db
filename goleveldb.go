@@ -12,6 +12,38 @@ import (
 	"github.com/syndtr/goleveldb/leveldb/util"
 )
 
+const (
+	// GoLevelDB tuning constants optimized for Cosmos SDK workloads.
+	// All options are backwards compatible with existing databases.
+
+	// goleveldbBloomFilterBits is bits per key for bloom filter.
+	// Already set in current implementation (10 bits = ~1% false positive rate).
+	goleveldbBloomFilterBits = 10
+
+	// goleveldbOpenFilesCacheCapacity is the number of open file handles.
+	// Increased from default (500) to reduce file handle churn.
+	goleveldbOpenFilesCacheCapacity = 1024
+
+	// goleveldbCompactionTableSize is the target size for SST files (64 MB).
+	// Larger than default (2 MB) to reduce file count and improve read performance.
+	// Safe: new files only, old files remain readable.
+	goleveldbCompactionTableSize = 64 << 20
+
+	// goleveldbCompactionTotalSizeMultiplier controls level size growth.
+	// Higher than default (10) for less aggressive compaction.
+	goleveldbCompactionTotalSizeMultiplier = 15.0
+
+	// goleveldbWriteBufferMin is the minimum write buffer size (64 MB).
+	goleveldbWriteBufferMin = 64 << 20
+
+	// goleveldbCacheFallback is the fallback cache size when RAM detection fails (4 GB).
+	goleveldbCacheFallback = 4 << 30
+
+	// goleveldbCacheMax is the maximum cache size to prevent excessive GC pauses.
+	// 16 GB provides good performance while keeping GC pauses under 400ms.
+	goleveldbCacheMax = 16 << 30
+)
+
 func init() {
 	dbCreator := func(name string, dir string, opts Options) (DB, error) {
 		return NewGoLevelDB(name, dir, opts)
@@ -26,13 +58,49 @@ type GoLevelDB struct {
 var _ DB = (*GoLevelDB)(nil)
 
 func NewGoLevelDB(name string, dir string, opts Options) (*GoLevelDB, error) {
-	defaultOpts := &opt.Options{
-		Filter: filter.NewBloomFilter(10), // by default, goleveldb doesn't use a bloom filter.
+	// Detect system resources for auto-tuning
+	sysRes := GetSystemResources()
+
+	// Calculate cache size: 1/3 of RAM, capped at 16 GB to limit GC pauses
+	cacheSize := sysRes.TotalRAM / 3
+	if cacheSize == 0 {
+		cacheSize = goleveldbCacheFallback
 	}
+	if cacheSize > goleveldbCacheMax {
+		cacheSize = goleveldbCacheMax
+	}
+
+	// Calculate write buffer: cache / 4, minimum 64 MB
+	writeBuffer := cacheSize / 4
+	if writeBuffer < goleveldbWriteBufferMin {
+		writeBuffer = goleveldbWriteBufferMin
+	}
+
+	defaultOpts := &opt.Options{
+		// Essential: Bloom filter for read performance
+		// Safe: applies to new SST files only, old files work without filter
+		Filter: filter.NewBloomFilter(goleveldbBloomFilterBits),
+
+		// Auto-tuned based on system resources (runtime only, always safe)
+		BlockCacheCapacity: int(cacheSize),
+		WriteBuffer:        int(writeBuffer),
+
+		// Fixed optimizations (all backwards compatible)
+		OpenFilesCacheCapacity:        goleveldbOpenFilesCacheCapacity,
+		CompactionTableSize:           goleveldbCompactionTableSize,
+		CompactionTotalSizeMultiplier: goleveldbCompactionTotalSizeMultiplier,
+	}
+
+	// Override from user-provided options
 	if opts != nil {
-		files := cast.ToInt(opts.Get("maxopenfiles"))
-		if files > 0 {
+		if files := cast.ToInt(opts.Get("maxopenfiles")); files > 0 {
 			defaultOpts.OpenFilesCacheCapacity = files
+		}
+		if cache := cast.ToInt(opts.Get("cache")); cache > 0 {
+			defaultOpts.BlockCacheCapacity = cache << 20 // MB to bytes
+		}
+		if wb := cast.ToInt(opts.Get("writebuffer")); wb > 0 {
+			defaultOpts.WriteBuffer = wb << 20 // MB to bytes
 		}
 	}
 
