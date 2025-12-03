@@ -170,9 +170,8 @@ func NewPebbleDB(name string, dir string, opts Options) (DB, error) {
 	for i := 0; i < len(do.Levels); i++ {
 		l := &do.Levels[i]
 
-		// Block configuration optimized for Cosmos SDK
-		l.BlockSize = pebbleBlockSize
-		l.IndexBlockSize = pebbleIndexBlockSize
+		// NOTE: BlockSize and IndexBlockSize are NOT set to maintain
+		// compatibility with state-sync snapshots (use PebbleDB defaults).
 
 		// Tiered compression:
 		// - L0-L2 (hot): Snappy for faster compression/decompression
