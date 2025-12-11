@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/bloom"
 	"github.com/spf13/cast"
 )
 
@@ -178,9 +179,13 @@ func NewPebbleDB(name string, dir string, opts Options) (DB, error) {
 		// unexpected buffer" errors when receiving SST files during state-sync that were
 		// created with different compression settings.
 
-		// NOTE: FilterPolicy and FilterType (bloom filters) are NOT set to maintain
-		// compatibility with state-sync snapshots. While bloom filters should be safe in
-		// theory, they may interact badly with snapshot restoration during state-sync.
+		// Bloom filter on all levels except bottommost (level 6)
+		// Bottommost level doesn't benefit as much from bloom filters
+		// Safe: Bloom filters are optional SST metadata, files with/without filters coexist
+		if i < pebbleLevelCount-1 {
+			l.FilterPolicy = bloom.FilterPolicy(pebbleBloomFilterBits)
+			l.FilterType = pebble.TableFilter
+		}
 
 		// Target file size doubles per level
 		if i == 0 {
