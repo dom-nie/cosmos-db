@@ -158,9 +158,9 @@ func NewPebbleDB(name string, dir string, opts Options) (DB, error) {
 		L0StopWritesThreshold:       pebbleL0StopWritesThreshold,
 		LBaseMaxBytes:               pebbleLBaseMaxBytes,
 
-		// Note: FormatMajorVersion is not set to allow PebbleDB to auto-detect
-		// the format from existing databases. This ensures compatibility with
-		// snapshots created on different versions.
+		// NOTE: FormatMajorVersion is NOT set to allow PebbleDB to auto-detect
+		// the format from existing databases and snapshots. This ensures maximum
+		// compatibility with state-sync snapshots from different versions.
 
 		// Configure 7-level LSM tree
 		Levels: make([]pebble.LevelOptions, pebbleLevelCount),
@@ -173,21 +173,15 @@ func NewPebbleDB(name string, dir string, opts Options) (DB, error) {
 		// NOTE: BlockSize and IndexBlockSize are NOT set to maintain
 		// compatibility with state-sync snapshots (use PebbleDB defaults).
 
-		// Tiered compression:
-		// - L0-L2 (hot): Snappy for faster compression/decompression
-		// - L3-L6 (cold): Zstd for better compression ratio
-		if i < pebbleHotLevels {
-			l.Compression = pebble.SnappyCompression
-		} else {
-			l.Compression = pebble.ZstdCompression
-		}
+		// NOTE: Compression is NOT set to maintain compatibility with state-sync snapshots.
+		// PebbleDB defaults to uniform Snappy compression across all levels.
+		// Tiered compression (different algorithms per level) causes "decompressed into
+		// unexpected buffer" errors when receiving SST files during state-sync that were
+		// created with different compression settings.
 
-		// Bloom filter on all levels except bottommost (level 6)
-		// Bottommost level doesn't benefit as much from bloom filters
-		if i < pebbleLevelCount-1 {
-			l.FilterPolicy = bloom.FilterPolicy(pebbleBloomFilterBits)
-			l.FilterType = pebble.TableFilter
-		}
+		// NOTE: FilterPolicy and FilterType (bloom filters) are NOT set to maintain
+		// compatibility with state-sync snapshots. While bloom filters should be safe in
+		// theory, they may interact badly with snapshot restoration during state-sync.
 
 		// Target file size doubles per level
 		if i == 0 {
