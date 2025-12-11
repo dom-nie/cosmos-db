@@ -11,7 +11,12 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+
+    env:
+      GO_VERSION: "1.25.5"
+      INJECTIVE_VERSION: "v1.17.1"
+      INJECTIVE_REPO: "https://github.com/InjectiveFoundation/injective-core.git"
 
     steps:
       - name: Checkout cosmos-db
@@ -19,12 +24,12 @@ jobs:
 
       - name: Install Go
         run: |
-          wget -q https://go.dev/dl/go1.25.5.linux-amd64.tar.gz
-          sudo tar -C /usr/local -xzf go1.25.5.linux-amd64.tar.gz
+          wget -q https://go.dev/dl/go${{ env.GO_VERSION }}.linux-amd64.tar.gz
+          sudo tar -C /usr/local -xzf go${{ env.GO_VERSION }}.linux-amd64.tar.gz
           echo "/usr/local/go/bin" >> $GITHUB_PATH
 
       - name: Clone Injective
-        run: git clone --branch v1.17.1 https://github.com/InjectiveFoundation/injective-core.git
+        run: git clone --branch ${{ env.INJECTIVE_VERSION }} ${{ env.INJECTIVE_REPO }} injective-core
 
       - name: Replace cosmos-db
         working-directory: injective-core
